@@ -60,6 +60,7 @@ def export_access_rulebase(package, layer, layer_uid, client, timestamp, tar_fil
 
     debug_log("Exporting access rules from layer [" + layer + "]", True)
 
+    debug_log("DEBUG: About to export {0} access rules".format(len(rulebase_rules)), True)
     format_and_merge_data(data_dict, rulebase_rules)
 
     debug_log("Exporting access sections from layer [" + layer + "]", True)

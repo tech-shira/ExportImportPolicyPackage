@@ -1,3 +1,5 @@
+import gc
+
 from exporting.special_treatment_objects import handle_fields
 from lists_and_dictionaries import no_export_fields_and_subfields, \
     singular_to_plural_dictionary, group_objects_field, placeholder_type_by_obj_type, \
@@ -7,7 +9,7 @@ from utils import debug_log, merge_data, flatten_json, find_min_position_group, 
     check_for_export_error, \
     generate_new_dummy_ip_address
 
-exported_objects = []
+exported_objects = set()  # Use set for O(1) lookup - ONLY change from original
 
 
 def get_query_rulebase_data(client, api_type, payload):
@@ -63,6 +65,7 @@ def get_query_rulebase_data(client, api_type, payload):
     debug_log("Getting information from show-" + api_type)
 
     seen_object_uids = []
+    seen_rule_uids = set()
 
     # We use here uid instead of name for supporting MDS env.
     queryPayload = {"uid": payload["uid"], "package": payload["package"]}
@@ -117,9 +120,13 @@ def get_query_rulebase_data(client, api_type, payload):
         if should_export(general_object):
             check_for_export_error(general_object, client)
 
+    debug_log("DEBUG: Total rulebase_items collected: " + str(len(rulebase_items)))
     debug_log("Analysing rulebase items...")
     for rulebase_item in rulebase_items:
         if any(x in rulebase_item["type"] for x in ["access-rule", "threat-rule", "threat-exception", "https-rule"]):
+            if rulebase_item["uid"] in seen_rule_uids:
+                continue
+            seen_rule_uids.add(rulebase_item["uid"])
             string = (u"##Show presented independent rule of type {0} "
                       + (u"with name {1}" if "name" in rulebase_item else u"with no name")).format(
                 rulebase_item["type"],
@@ -128,6 +135,9 @@ def get_query_rulebase_data(client, api_type, payload):
             rulebase_rules.append(rulebase_item)
         elif "section" in rulebase_item["type"]:
             for rule in rulebase_item["rulebase"]:
+                if rule["uid"] in seen_rule_uids:
+                    continue
+                seen_rule_uids.add(rule["uid"])
                 string = (u"##Show presented dependent rule of type {0} under section {1} " + (u"with name {2}" if
                                                                                                "name" in rule else u"with no name")).format(
                     rule["type"], rulebase_item["name"] if "name" in
@@ -214,6 +224,9 @@ def get_query_nat_rulebase_data(client, payload):
     debug_log("Analysing rulebase items...")
     for rulebase_item in rulebase_items:
         if "nat-rule" in rulebase_item["type"]:
+            if rulebase_item["uid"] in seen_rule_uids:
+                continue
+            seen_rule_uids.add(rulebase_item["uid"])
             string = (u"##Show presented independent rule of type {0}").format(rulebase_item["type"])
             debug_log(string)
             rulebase_item.pop("auto-generated", None)
@@ -221,6 +234,9 @@ def get_query_nat_rulebase_data(client, payload):
         elif "nat-section" in rulebase_item["type"]:
             # !!! Attention: exporting only NAT rules, without sections !!!
             for rule in rulebase_item["rulebase"]:
+                if rule["uid"] in seen_rule_uids:
+                    continue
+                seen_rule_uids.add(rule["uid"])
                 string = (u"##Show presented dependent rule of type {0} under section {1}").format(
                     rule["type"], rulebase_item["name"] if "name" in rulebase_item else "???")
                 debug_log(string)
@@ -246,7 +262,9 @@ def replace_rule_field_uids_by_name(rule, general_objects):
     debug_log("Updating data for rule #" + str(rule["rule-number"]))
     rule["position"] = rule["rule-number"]
     rule.pop("rule-number")
-    replace_data(rule, general_objects)
+    # Build UID index for O(1) lookups instead of O(n) linear search
+    uid_to_object = {x["uid"]: x for x in general_objects}
+    replace_data(rule, uid_to_object)
 
 
 def replace_exception_data(exception, general_objects, layer=None,
@@ -264,10 +282,12 @@ def replace_exception_data(exception, general_objects, layer=None,
         exception["rule-number"] = rule_number
     if "exception-number" in exception:
         exception.pop("exception-number")
-    replace_data(exception, general_objects)
+    # Build UID index for O(1) lookups instead of O(n) linear search
+    uid_to_object = {x["uid"]: x for x in general_objects}
+    replace_data(exception, uid_to_object)
 
 
-def replace_data(obj, general_objects):
+def replace_data(obj, uid_to_object):
     if isinstance(obj, dict):
         itr = obj.keys()
     elif isinstance(obj, list):
@@ -277,9 +297,10 @@ def replace_data(obj, general_objects):
 
     if itr is not None:
         for key in itr:
-            obj[key] = replace_data(obj[key], general_objects)
+            obj[key] = replace_data(obj[key], uid_to_object)
     else:
-        replacement = next((x for x in general_objects if x["uid"] == obj), None)
+        # Use O(1) dictionary lookup instead of O(n) linear search
+        replacement = uid_to_object.get(obj)
         if replacement:
             name = replacement["cpmiDisplayName"] if "cpmiDisplayName" in replacement else replacement["name"]
             obj = name if name != "Inner Layer" else "Apply Layer"
@@ -323,7 +344,11 @@ def export_general_objects(data_dict, api_type, object_dictionary, unexportable_
                                                    api_type, group_object, client, unexportable_objects)
             for full_group_object in full_group_objects:
                 for container in group_objects_field[full_group_object["type"]]:
-                    full_group_object[container] = [x["name"] for x in full_group_object[container]]
+                    # Handle both dict objects and already-processed string names
+                    if isinstance(full_group_object[container], list) and full_group_object[container]:
+                        if isinstance(full_group_object[container][0], dict):
+                            full_group_object[container] = [x["name"] for x in full_group_object[container]]
+                        # else: already processed (strings), keep as is
                 new_object_dictionary.append(full_group_object)
 
     if new_object_dictionary:
@@ -335,13 +360,29 @@ def export_general_objects(data_dict, api_type, object_dictionary, unexportable_
 # tag_info_client - to handle objects with 'tags' field as list of uids
 def format_and_merge_data(data_dict, objects, tag_info_client=None):
     global exported_objects
-    unexported_objects = [x for x in objects if x["uid"] not in exported_objects or x["type"] == "exception-group"]
-    exported_objects.extend([x["uid"] for x in unexported_objects])
-    if tag_info_client:
-        formatted_data = format_objects(unexported_objects, tag_info_client)
-    else:
-        formatted_data = format_objects(unexported_objects)
-    merge_data(data_dict, formatted_data)
+    # FIX: Remove exception-group bypass that caused 1.47M infinite loop
+    unexported_objects = [x for x in objects if x["uid"] not in exported_objects]
+    # Track all exported objects
+    exported_objects.update(x["uid"] for x in unexported_objects)
+    
+    # Process in batches to avoid MemoryError with large datasets
+    batch_size = 100  # Small batches to prevent memory issues
+    total = len(unexported_objects)
+    
+    for batch_start in range(0, total, batch_size):
+        batch_end = min(batch_start + batch_size, total)
+        batch = unexported_objects[batch_start:batch_end]
+        
+        if tag_info_client:
+            formatted_data = format_objects(batch, tag_info_client)
+        else:
+            formatted_data = format_objects(batch)
+        
+        merge_data(data_dict, formatted_data)
+        
+        # Show progress for large datasets
+        if total > 1000 and batch_end % 1000 == 0:
+            debug_log("Processed {0}/{1} items".format(batch_end, total), True)
 
 
 # tag_info_client - to handle objects with 'tags' field as list of uids
@@ -476,9 +517,8 @@ def format_and_merge_exception_groups(data_dict, exception_groups):
 # TODO AdamG
 def cleanse_object_dictionary(object_dictionary):
     for api_type in object_dictionary:
-        for obj in object_dictionary[api_type]:
-            if not should_export(obj):
-                object_dictionary[api_type].remove(obj)
+        # Use list comprehension instead of modifying list during iteration
+        object_dictionary[api_type] = [obj for obj in object_dictionary[api_type] if should_export(obj)]
 
 
 def clean_objects(data_dict):

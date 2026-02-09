@@ -33,7 +33,7 @@ if __name__ == "__main__":
     args_for_client = APIClientArgs(server=args.management, port=args.port,
                                     sid=args.session_id, debug_file=log_file,
                                     proxy_host=args.proxy, proxy_port=args.proxy_port, unsafe=args.unsafe,
-                                    unsafe_auto_accept=args.unsafe_auto_accept, cloud_mgmt_id=args.cloud_mgmt_id)
+                                    unsafe_auto_accept=args.unsafe_auto_accept)
 
     with APIClient(args_for_client) as client:
         payload = {}
@@ -41,6 +41,8 @@ if __name__ == "__main__":
             payload["read-only"] = "true" if args.operation == "export" else "false"
             if args.session_timeout:
                 payload["session-timeout"] = args.session_timeout
+            else:
+                payload["session-timeout"] = 3600  # Default: 1 hour (maximum allowed by server)
             if args.api_key:
                 login_reply = client.login_with_api_key(api_key=args.api_key, domain=args.domain,
                                                         payload=payload)
@@ -51,6 +53,8 @@ if __name__ == "__main__":
         elif args.login == '2':
             if args.session_timeout:
                 payload["session-timeout"] = args.session_timeout
+            else:
+                payload["session-timeout"] = 3600  # Default: 1 hour (maximum allowed by server)
             client.login_as_root(domain=args.domain, payload=payload)
         elif args.login == '3':
             args.session_file = input("Please enter path to session file: ")
