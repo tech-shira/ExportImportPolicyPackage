@@ -64,7 +64,8 @@ updatable_objects_repository_initialized = False
 imported_nat_top_section_uid = None
 
 # Section UIDs mapping for placing rules under correct sections
-# Format: {layer_name: {section_name: {"uid": "...", "start_pos": X, "end_pos": Y}}}
+# Format: {layer_name: {start_position: {"uid": "...", "name": "...", "start": X, "end": Y}}}
+# Using start_position as key (not name) to support duplicate section names
 section_uid_map = {}
 
 def build_section_position_ranges(sections_data):
@@ -92,7 +93,7 @@ def build_section_position_ranges(sections_data):
 def find_section_for_rule_position(rule_position, layer_name):
     """
     Find which section a rule should belong to based on its position.
-    Returns: section name or None
+    Returns: start_position (key) of matching section, or None
     """
     global section_uid_map
     if layer_name not in section_uid_map:
@@ -100,9 +101,9 @@ def find_section_for_rule_position(rule_position, layer_name):
     
     try:
         pos = int(rule_position)
-        for section_name, section_data in section_uid_map[layer_name].items():
+        for start_pos, section_data in section_uid_map[layer_name].items():
             if section_data['start'] <= pos <= section_data['end']:
-                return section_name
+                return start_pos  # Return the key (start_position), not the name
     except (ValueError, KeyError):
         pass
     return None
@@ -320,8 +321,10 @@ def import_objects(file_name, client, changed_layer_names, package, layer=None, 
                         section_uid_map[layer_name] = {}
                     
                     for range_data in section_ranges:
-                        section_uid_map[layer_name][range_data['name']] = {
+                        # Use start position as key (not name) to handle duplicate section names
+                        section_uid_map[layer_name][range_data['start']] = {
                             'uid': None,  # Will be filled when section is created
+                            'name': range_data['name'],
                             'start': range_data['start'],
                             'end': range_data['end']
                         }
@@ -669,15 +672,6 @@ def add_object(line, counter, position_decrement_due_to_rule, position_decrement
         position_decrements_for_sections.append(position_decrement_due_to_rule)
 
     payload, _ = create_payload(fields, line, 0, api_type, client.api_version)
-    
-    # CRITICAL FIX: Skip creation for infrastructure objects that cannot be created via API
-    # checkpoint-host and cluster-member are pre-existing infrastructure objects in CheckPoint
-    # They can be queried (show works) but cannot be created (add fails with HV000028)
-    # These objects already exist in the destination system with the same UIDs
-    if api_type in ("checkpoint-host", "cluster-member"):
-        debug_log(f"Skipping creation of infrastructure object '{payload.get('name', 'UNKNOWN')}' (type: {api_type}) - already exists in system", True)
-        return counter + 1, position_decrement_due_to_rule
-    
     if args is not None and args.objects_suffix != "":
         add_suffix_to_objects(payload, api_type, args.objects_suffix)
 
@@ -833,12 +827,14 @@ def add_object(line, counter, position_decrement_due_to_rule, position_decrement
                         pos_as_int = int(original_position)
                         
                         # Try to find which section this rule belongs to
-                        section_name = find_section_for_rule_position(original_position, layer_name)
+                        section_key = find_section_for_rule_position(original_position, layer_name)
                         
-                        if section_name:
+                        if section_key is not None:
                             # Get section UID
                             try:
-                                section_uid = section_uid_map.get(layer_name, {}).get(section_name, {}).get('uid')
+                                section_data = section_uid_map.get(layer_name, {}).get(section_key, {})
+                                section_uid = section_data.get('uid')
+                                section_name = section_data.get('name', 'unknown')
                                 if section_uid:
                                     # Place rule at bottom of its section - FAST (no rulebase scan)
                                     payload["position"] = {"bottom": section_uid}
@@ -994,9 +990,17 @@ def add_object(line, counter, position_decrement_due_to_rule, position_decrement
                     layer_name = payload.get("layer")
                     
                     if section_uid and section_name and layer_name:
-                        if layer_name in section_uid_map and section_name in section_uid_map[layer_name]:
-                            section_uid_map[layer_name][section_name]['uid'] = section_uid
-                            debug_log(f"  Saved UID for section '{section_name}' in layer '{layer_name}'", True)
+                        # Find the section by name AND position to handle duplicates
+                        section_position = payload.get("position")
+                        if isinstance(section_position, str) and section_position.isdigit():
+                            section_position = int(section_position)
+                        # Find matching section key (start position) in the map
+                        if layer_name in section_uid_map:
+                            for start_pos, sec_data in section_uid_map[layer_name].items():
+                                if sec_data['name'] == section_name and sec_data['uid'] is None:
+                                    section_uid_map[layer_name][start_pos]['uid'] = section_uid
+                                    debug_log(f"  Saved UID for section '{section_name}' (pos {start_pos}) in layer '{layer_name}'", True)
+                                    break
                 except Exception as e:
                     debug_log(f"Warning: Could not save section UID: {e}", True, True)
         else:
